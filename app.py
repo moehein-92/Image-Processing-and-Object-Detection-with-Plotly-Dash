@@ -1,11 +1,17 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Nov 7 00:53:07 2021
+
+@author: Regina and Moe
+"""
 import base64
-from io import BytesIO
+from io import BytesIO  as _BytesIO
 import time
 
 import dash
 from dash.dependencies import Input, Output, State
-import dash_core_components as dcc
-import dash_html_components as html
+from dash import dcc
+from dash import html
 import plotly.graph_objects as go
 from PIL import Image
 import requests
@@ -13,11 +19,16 @@ import requests
 from model import detect, filter_boxes, detr, transform
 from model import CLASSES, DEVICE
 
+import dash_reusable_components as drc
+import utils
+
+import dash_bootstrap_components as dbc
+import tensorflow as tf
+import tensorflow_hub as hub
 
 # Dash component wrappers
 def Row(children=None, **kwargs):
     return html.Div(children, className="row", **kwargs)
-
 
 def Column(children=None, width=1, **kwargs):
     nb_map = {
@@ -28,10 +39,11 @@ def Column(children=None, width=1, **kwargs):
 
 
 # plotly.py helper functions
-def pil_to_b64(im, enc="png"):
-    io_buf = BytesIO()
+def a_pil_to_b64(im, enc="png"):
+    io_buf = _BytesIO()
     im.save(io_buf, format=enc)
     encoded = base64.b64encode(io_buf.getvalue()).decode("utf-8")
+
     return f"data:img/{enc};base64, " + encoded
 
 
@@ -46,7 +58,7 @@ def pil_to_fig(im, showlegend=False, title=None):
         hoverinfo="none", legendgroup='Image'))
 
     fig.add_layout_image(dict(
-        source=pil_to_b64(im), sizing="stretch", opacity=1, layer="below",
+        source=a_pil_to_b64(im), sizing="stretch", opacity=1, layer="below",
         x=0, y=0, xref="x", yref="y", sizex=img_width, sizey=img_height,))
 
     # Adapt axes to the right width and height, lock aspect ratio
@@ -61,6 +73,29 @@ def pil_to_fig(im, showlegend=False, title=None):
     fig.update_layout(title=title, showlegend=showlegend)
 
     return fig
+
+
+def tf_to_b64(tensor, ext="jpeg"):
+    buffer = BytesIO()
+
+    image = tf.cast(tf.clip_by_value(tensor[0], 0, 255), tf.uint8).numpy()
+    Image.fromarray(image).save(buffer, format=ext)
+    encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+    return f"data:image/{ext};base64, {encoded}"
+
+
+def image_card(src, header=None):
+    return dbc.Card(
+        [
+            dbc.CardHeader(header),
+            dbc.CardBody(html.Img(src=src, style={"width": "100%"})),
+        ]
+    )
+
+
+# Load ML model
+model = hub.load("https://tfhub.dev/captain-pool/esrgan-tf2/1")
 
 
 def add_bbox(fig, x0, y0, x1, y1, 
@@ -90,20 +125,51 @@ RANDOM_URLS = open('random_urls.txt').read().split('\n')[:-1]
 print("Running on:", DEVICE)
 
 # Start Dash
-app = dash.Dash(__name__)
+app = dash.Dash(__name__, suppress_callback_exceptions=True,
+                external_stylesheets=[dbc.themes.BOOTSTRAP]) # BOOTSTRAP
 server = app.server  # Expose the server variable for deployments
 
-app.layout = html.Div(className='container', children=[
-    Row(html.H1("Dash DETR Detection App")),
+colors = {
+    'title': '#FFFFFF',
+    'text': '#AOAABA',
+    'background': '#161A1D'
+}
 
+app.layout = html.Div(className='container', children=[
+    Row(html.H2("Object  Detection  and  Image  Processing",
+        style={'textAlign':'center', 'color': colors['text']})),
+
+    html.Hr(),
     Row(html.P("Input Image URL:")),
     Row([
         Column(width=8, children=[
             dcc.Input(id='input-url', style={'width': '100%'}, placeholder='Insert URL...'),
         ]),
-        Column(html.Button("Run DETR", id='button-run', n_clicks=0), width=2),
+        Column(html.Button("Detect", id="button-run", n_clicks=0), width=2),
         Column(html.Button("Random Image", id='button-random', n_clicks=0), width=2)
     ]),
+
+    Row(dcc.Graph(id='image-output', style={"height": "70vh"}),),
+    Row(dcc.Graph(id='image-gamma', style={"height": "70vh"}),),
+    Row(Column(width=10, children=[
+            html.P('Select Gamma'),
+            dcc.Slider(
+                id='slider-gamma', min=0, max=16, step=0.05, value=2.2, 
+                marks={0: '0', 0.5: '0.5', 1: '1', 2.2: '2.2', 4: '4', 8: '8', 12: '12', 16: '16'},
+                tooltip={'always_visible': True, 'placement':'bottom'})
+    ])),
+    Row(dcc.Graph(id='image-BandW-PIL', style={"height": "70vh"}),),
+    Row(dcc.Graph(id='image-BandW-thresh', style={"height": "70vh"}),),
+    Row(Column(width=10, children=[
+            html.P('Select Threshold:'),
+            dcc.Slider(
+                id='slider-threshold', min=0, max=255, step=1, value=125, 
+                marks={0: '0', 50: '50', 100: '100', 150: '150', 200: '200', 250: '',255: '255'},
+                tooltip={'always_visible': True, 'placement':'bottom'})
+    ])),   
+    Row(dcc.Graph(id="graph-histogram",
+        figure={"layout": {"paper_bgcolor": "#272a31","plot_bgcolor": "#272a31",}},
+        config={"displayModeBar": False},),),
 
     Row(dcc.Graph(id='model-output', style={"height": "70vh"})),
 
@@ -125,9 +191,10 @@ app.layout = html.Div(className='container', children=[
             html.P('Confidence Threshold:'),
             dcc.Slider(
                 id='slider-confidence', min=0, max=1, step=0.05, value=0.7, 
-                marks={0: '0', 1: '1'})
+                marks={0: '0', 1: '1'},
+                tooltip={'always_visible': True, 'placement':'bottom'})
         ])
-    ])
+    ])   
 ])
 
 
@@ -138,7 +205,6 @@ app.layout = html.Div(className='container', children=[
     [State('button-run', 'n_clicks')])
 def randomize(random_n_clicks, run_n_clicks):
     return run_n_clicks+1, RANDOM_URLS[random_n_clicks%len(RANDOM_URLS)]
-
 
 @app.callback(
     [Output('model-output', 'figure'),
@@ -155,7 +221,7 @@ def run_model(n_clicks, n_submit, iou, confidence, checklist, url):
         im = Image.open(requests.get(url, stream=True).raw)
     except:
         return go.Figure().update_layout(title='Incorrect URL')
-
+    
     tstart = time.time()
     
     scores, boxes = detect(im, detr, transform, device=DEVICE)
@@ -166,7 +232,7 @@ def run_model(n_clicks, n_submit, iou, confidence, checklist, url):
 
     tend = time.time()
 
-    fig = pil_to_fig(im, showlegend=True, title=f'DETR Predictions ({tend-tstart:.2f}s)')
+    fig = pil_to_fig(im, showlegend=True, title=f'Object Detection ({tend-tstart:.2f}s)')
     existing_classes = set()
 
     for i in range(boxes.shape[0]):
@@ -188,6 +254,147 @@ def run_model(n_clicks, n_submit, iou, confidence, checklist, url):
         existing_classes.add(label)
 
     return fig, not apply_nms
+
+
+@app.callback(
+    [Output('image-output', 'figure')],
+    [Input('button-run', 'n_clicks'),
+     Input('input-url', 'n_submit')],
+    [State('input-url', 'value')])
+def run_model_im2(n_clicks, n_submit, url):
+    # apply_nms = 'enabled' in checklist
+    try:
+        im = Image.open(requests.get(url, stream=True).raw)
+    except:
+        return go.Figure().update_layout(title='Incorrect URL')
+    fig = pil_to_fig(im, showlegend=True, title=f'Original Image')
+    return [go.Figure(fig)]
+
+@app.callback(
+    [Output('image-gamma', 'figure')],
+    [Input('button-run', 'n_clicks'),
+     Input('slider-gamma', 'value'),
+     Input('input-url', 'n_submit')],
+    [State('input-url', 'value')])
+def run_model_im3(n_clicks, gamma, n_submit, url):
+    try:
+        im = Image.open(requests.get(url, stream=True).raw)
+    except:
+        return go.Figure().update_layout(title='Incorrect URL')
+    gamma1 = gamma
+    row = im.size[0]
+    col = im.size[1]
+    result_img1 = Image.new("RGB", (row, col))
+    for x in range(0 , row):
+        for y in range(0, col):
+            r = pow(im.getpixel((x,y))[0]/255, (1/gamma1))*255
+            g = pow(im.getpixel((x,y))[1]/255, (1/gamma1))*255
+            b = pow(im.getpixel((x,y))[2]/255, (1/gamma1))*255
+            if r >= 255:
+                r = 255
+            if g >= 255:
+                g = 255
+            if b >= 255:
+                b = 255
+            result_img1.putpixel((x,y), (int(r), int(g), int(b)))
+
+
+    fig = pil_to_fig(result_img1, showlegend=True, title=f'Gamma Corrected Image')
+    return [go.Figure(fig)]
+
+
+@app.callback(
+    [Output('image-BandW-PIL', 'figure')],
+    [Input('button-run', 'n_clicks'),
+     Input('input-url', 'n_submit')],
+    [State('input-url', 'value')])
+def run_model_im4(n_clicks, n_submit, url):
+    try:
+        im = Image.open(requests.get(url, stream=True).raw).convert('1')
+    except:
+        return go.Figure().update_layout(title='Incorrect URL')
+    fig = pil_to_fig(im, showlegend=True, title=f'Thresholding with Black and White Dithering')
+    return [go.Figure(fig)]
+
+@app.callback(
+    [Output('image-BandW-thresh', 'figure')],
+    [Input('button-run', 'n_clicks'),
+     Input('slider-threshold', 'value'),
+     Input('input-url', 'n_submit')],
+    [State('input-url', 'value')])
+def run_model_im5(n_clicks, thresh, n_submit, url):
+    try:
+        im = Image.open(requests.get(url, stream=True).raw)
+    except:
+        return go.Figure().update_layout(title='Incorrect URL')
+    #thresh = 200
+    fn = lambda x : 255 if x > thresh else 0
+    imT = im.convert('L').point(fn, mode='1')    
+    fig = pil_to_fig(imT, showlegend=True, title=f'Thresholding with Binary Segmentation')
+    return [go.Figure(fig)]
+
+@app.callback(
+    Output("graph-histogram", "figure"), 
+    [Input('button-run', 'n_clicks'),
+     Input('input-url', 'n_submit')],
+    [State('input-url', 'value')])
+def update_histogram(n_clicks, n_submit, url):
+    try:
+        im = Image.open(requests.get(url, stream=True).raw)
+    except:
+        return go.Figure().update_layout(title='Incorrect URL')
+
+    return utils.show_histogram(im)
+
+@app.callback(
+    [Output('image-thresholding-output', 'figure')],
+    [Input('button-run', 'n_clicks'),
+     Input('input-url', 'n_submit')],
+    [State('input-url', 'value')])
+def run_model_threshim(n_clicks, n_submit, url):
+    # apply_nms = 'enabled' in checklist
+    try:
+        im = Image.open(requests.get(url, stream=True).raw)
+    except:
+        return go.Figure().update_layout(title='Incorrect URL')
+
+    npim = drc.b64_to_numpy(drc.pil_to_b64(im))
+    binary_mask = npim *2
+    imthreshpil = drc.b64_to_pil(drc.numpy_to_b64(binary_mask))
+    fig = pil_to_fig(imthreshpil, showlegend=True, title=f'Thresholding')
+    return [go.Figure(fig)]
+
+
+@app.callback(
+    Output("graph-histogram-colorsOLD", "figure"), 
+    [Input("interactive-image", "figure")],)
+def update_histogram(figure):
+    # Retrieve the image stored inside the figure
+    enc_str = figure["layout"]["images"][0]["source"].split(";base64,")[-1]
+    # Creates the PIL Image object from the b64 png encoding
+    im_pil = a_b64_to_pil(string=enc_str)
+
+    return utils.show_histogram(im_pil)
+
+
+@app.callback(
+    [Output("original-img", "children"), Output("enhanced-img", "children")],
+    [Input("img-upload", "contents")],
+    [State("img-upload", "filename")],
+)
+def enhance_image(img_str, filename):
+    if img_str is None:
+        return dash.no_update, dash.no_update
+
+    # sr_str = img_str # PLACEHOLDER
+    low_res = preprocess_b64(img_str)
+    super_res = model(tf.cast(low_res, tf.float32))
+    sr_str = tf_to_b64(super_res)
+
+    lr = image_card(img_str, header="Original Image")
+    sr = image_card(sr_str, header="Enhanced Image")
+
+    return lr, sr
 
 
 if __name__ == '__main__':
